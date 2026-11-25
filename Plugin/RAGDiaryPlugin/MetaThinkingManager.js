@@ -1789,9 +1789,591 @@ class MetaThinkingManager {
         return scores;
     }
 
+    _v3UsesNativeKnowledgeRuntime(vdb) {
+        return Boolean(
+            vdb
+            && vdb.nativeKnowledgeRuntime
+            && typeof vdb.nativeKnowledgeRuntime.listIndexedFilePaths === 'function'
+            && typeof vdb.hydrateChunksByFilePaths === 'function'
+        );
+    }
+
+    _v3GetNativeDatabaseGeneration(vdb) {
+        try {
+            if (typeof vdb?.nativeKnowledgeRuntime?.databaseGeneration === 'function') {
+                const gen = Number(vdb.nativeKnowledgeRuntime.databaseGeneration());
+                if (Number.isFinite(gen) && gen >= 0) return gen;
+            }
+        } catch (_) {
+            // ignore
+        }
+        return null;
+    }
+
+    _v3ParseEpaBasisValue(rawValue) {
+        if (typeof rawValue !== 'string' || !rawValue) return null;
+        try {
+            const crypto = require('node:crypto');
+            const parsed = JSON.parse(rawValue);
+            const sig = String(parsed?.artifactSig || '');
+            const digest = crypto.createHash('sha256').update(rawValue).digest('hex').slice(0, 16);
+            const b64 = parsed?.mean;
+            if (typeof b64 !== 'string' || !b64) return { sig, digest, value: null };
+            const buf = Buffer.from(b64, 'base64');
+            if (buf.byteLength === 0 || buf.byteLength % 4 !== 0) return { sig, digest, value: null };
+            const f32 = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+            const unit = this._v3NormalizeVector(f32);
+            return { sig, digest, value: unit || null };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /**
+     * 在独立子进程（隔离 OS PID）中只读读取 kv_store.value：
+     * - Linux/POSIX 下 fcntl() 锁按 (PID, Inode) 归属；主进程若与 vexus-lite (rusqlite) 共用
+     *   better-sqlite3 打开同一 SQLite 文件，任意 SELECT 解锁或 close(fd) 都会误清同进程 rusqlite 的
+     *   WAL_READ_LOCK，导致并发写/checkpoint 时 .sqlite-shm mmap 触发 SIGBUS (BUS_ADRERR)。
+     * - 子进程拥有独立 PID，遵循标准 SQLite WAL 多进程协议，读完即退不留锁句柄。
+     */
+    _v3ReadKvValueIsolated(dbPath, key) {
+        return new Promise((resolve) => {
+            if (!dbPath || dbPath === ':memory:' || !key) {
+                resolve(null);
+                return;
+            }
+            const { execFile } = require('node:child_process');
+            let bs3Path = '';
+            try {
+                bs3Path = require.resolve('better-sqlite3');
+            } catch (_) {
+                bs3Path = '';
+            }
+            const helperScript = [
+                'const [dbPath, key, bs3Path] = process.argv.slice(1);',
+                'let value = null;',
+                'try {',
+                '  if (bs3Path) {',
+                '    const Database = require(bs3Path);',
+                '    const db = new Database(dbPath, { readonly: true, timeout: 1000 });',
+                '    try {',
+                '      const row = db.prepare("SELECT value FROM kv_store WHERE key = ? LIMIT 1").get(key);',
+                '      if (row && typeof row.value === "string") value = row.value;',
+                '    } finally { db.close(); }',
+                '  } else {',
+                '    const { DatabaseSync } = require("node:sqlite");',
+                '    const db = new DatabaseSync(dbPath, { readOnly: true });',
+                '    try {',
+                '      const row = db.prepare("SELECT value FROM kv_store WHERE key = ? LIMIT 1").get(key);',
+                '      if (row && typeof row.value === "string") value = row.value;',
+                '    } finally { db.close(); }',
+                '  }',
+                '} catch (_) {}',
+                'process.stdout.write(JSON.stringify({ value }));'
+            ].join('\n');
+            execFile(
+                process.execPath,
+                ['-e', helperScript, String(dbPath), String(key), bs3Path],
+                { timeout: 5000, maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+                (err, stdout) => {
+                    if (err || !stdout) {
+                        resolve(null);
+                        return;
+                    }
+                    try {
+                        const text = String(stdout).trim();
+                        const parsed = JSON.parse(text);
+                        resolve(typeof parsed?.value === 'string' ? parsed.value : null);
+                    } catch (_) {
+                        resolve(null);
+                    }
+                }
+            );
+        });
+    }
+
+    async _v3LoadEpaRecordIsolatedAsync(vdb, options = {}) {
+        const dbPath = vdb?.dbPath;
+        if (!dbPath || dbPath === ':memory:') return null;
+        if (!this._v3EpaMeanCache) this._v3EpaMeanCache = new Map();
+        if (!this._v3EpaMeanLoads) this._v3EpaMeanLoads = new Map();
+
+        const ttlMs = options.ttlMs ?? 15000;
+        const manifoldKey = options.manifoldKey ?? null;
+        const dbGen = options.dbGen !== undefined ? options.dbGen : this._v3GetNativeDatabaseGeneration(vdb);
+        const now = Date.now();
+        const cached = this._v3EpaMeanCache.get(dbPath);
+        if (cached && ttlMs > 0) {
+            const genSame = dbGen !== null && cached.dbGen === dbGen;
+            const manifoldSame = !manifoldKey || cached.manifoldKey === manifoldKey;
+            const ageMs = now - (cached.checkedAt || 0);
+            if (genSame && manifoldSame) return cached;
+            if (manifoldSame && ageMs < Math.max(ttlMs, 60000) && cached.value) return cached;
+        }
+
+        const flightKey = `${dbPath}\0${manifoldKey || 'nom'}\0${dbGen ?? 'nogen'}`;
+        if (this._v3EpaMeanLoads.has(flightKey)) {
+            return this._v3EpaMeanLoads.get(flightKey);
+        }
+
+        const job = (async () => {
+            try {
+                let rawValue = null;
+                if (typeof vdb?.nativeKnowledgeRuntime?.getKvValue === 'function') {
+                    const nativeRaw = await vdb.nativeKnowledgeRuntime.getKvValue(dbPath, 'epa_basis_cache');
+                    rawValue = typeof nativeRaw === 'string' ? nativeRaw : (nativeRaw?.value ?? null);
+                } else {
+                    rawValue = await this._v3ReadKvValueIsolated(dbPath, 'epa_basis_cache');
+                }
+                const loadedAt = Date.now();
+                const parsed = this._v3ParseEpaBasisValue(rawValue);
+                if (!parsed) {
+                    const entry = {
+                        sig: cached?.sig || '',
+                        digest: cached?.digest || null,
+                        dbGen,
+                        manifoldKey: manifoldKey || cached?.manifoldKey || null,
+                        checkedAt: loadedAt,
+                        value: cached?.value || null
+                    };
+                    this._v3EpaMeanCache.set(dbPath, entry);
+                    return entry;
+                }
+                if (cached && cached.sig && cached.sig === parsed.sig && cached.value) {
+                    cached.checkedAt = loadedAt;
+                    cached.dbGen = dbGen;
+                    if (manifoldKey) cached.manifoldKey = manifoldKey;
+                    if (parsed.digest) cached.digest = parsed.digest;
+                    return cached;
+                }
+                while (this._v3EpaMeanCache.size >= 4) {
+                    const oldestKey = this._v3EpaMeanCache.keys().next().value;
+                    if (oldestKey === undefined) break;
+                    this._v3EpaMeanCache.delete(oldestKey);
+                }
+                const entry = {
+                    sig: parsed.sig,
+                    digest: parsed.digest,
+                    dbGen,
+                    manifoldKey: manifoldKey || null,
+                    checkedAt: loadedAt,
+                    value: parsed.value
+                };
+                this._v3EpaMeanCache.set(dbPath, entry);
+                return entry;
+            } catch (_) {
+                return cached || null;
+            } finally {
+                this._v3EpaMeanLoads.delete(flightKey);
+            }
+        })();
+
+        this._v3EpaMeanLoads.set(flightKey, job);
+        return job;
+    }
+
+    _v3BuildStarPoolFromRows(rows, meta) {
+        const {
+            scopeKey,
+            manifold,
+            manifoldKey,
+            versionKey,
+            dbStatSig = null,
+            dbGen = null,
+            epaDigest = null,
+            epaMean = null,
+            options = {}
+        } = meta;
+        const MAX_STAR_POOL_CACHE_ENTRIES = 8;
+        const byName = new Map();
+        const allChunks = [];
+        let manifoldMissingStars = 0;
+        const hasVersionBaseline = Boolean(
+            (manifold?.trainedVersions && Object.keys(manifold.trainedVersions).length > 0)
+            || (manifold?.convertedVersions && Object.keys(manifold.convertedVersions).length > 0)
+        );
+
+        for (const row of rows) {
+            let raw = null;
+            if (row.vector instanceof Float32Array && row.vector.length > 0) {
+                raw = this._v3NormalizeVector(row.vector);
+            } else if (row.vec && row.vec.byteLength > 0 && row.vec.byteLength % 4 === 0) {
+                const f32 = new Float32Array(row.vec.buffer, row.vec.byteOffset, row.vec.byteLength / 4);
+                raw = this._v3NormalizeVector(f32);
+            }
+            if (!raw) continue;
+            const starName = this._extractV3StarName(row);
+            if (!starName) continue;
+
+            const cid = Number(row.chunkId ?? row.id);
+            const hasRowVersion = row.vectorVersion !== undefined && row.vectorVersion !== null;
+            const trainedVer = manifold?.convertedVersions?.[cid] ?? manifold?.trainedVersions?.[cid] ?? null;
+            let isVersionMatched;
+            if (!manifold || !hasVersionBaseline) {
+                isVersionMatched = true;
+            } else if (hasRowVersion) {
+                isVersionMatched = Boolean(
+                    Array.isArray(trainedVer)
+                    && Number(trainedVer[0]) === Number(row.vectorVersion)
+                    && Number(trainedVer[1]) === Number(row.fileId)
+                );
+            } else {
+                // 原生 hydrateChunksByFilePaths 未透传 vector_version：若在快照基线中则沿用 slot，
+                // 半径优先由 alignmentQuantiles 实时复现（与 Rust 0.00000 误差且自动兼容已编辑星卡）。
+                isVersionMatched = Boolean(Array.isArray(trainedVer) && Number(trainedVer[1]) === Number(row.fileId));
+            }
+            const slot = isVersionMatched ? manifold?.idToSlot?.get(cid) : undefined;
+            const inConvertedTail = Boolean(isVersionMatched && manifold?.convertedChunkIds?.has(cid));
+            if (manifold && slot === undefined && !inConvertedTail) manifoldMissingStars++;
+            let radius;
+            if (!hasRowVersion && manifold?.alignmentQuantiles && manifold?.meanAxis && raw.length === manifold.meanAxis.length) {
+                radius = this._v3ComputeChunkQuantileRadius(this._v3Dot(raw, manifold.meanAxis), manifold.alignmentQuantiles);
+            } else if (isVersionMatched && manifold?.radiusByChunkId && manifold.radiusByChunkId.has(cid)) {
+                radius = manifold.radiusByChunkId.get(cid);
+            } else if (manifold?.alignmentQuantiles && manifold?.meanAxis && raw.length === manifold.meanAxis.length) {
+                radius = this._v3ComputeChunkQuantileRadius(this._v3Dot(raw, manifold.meanAxis), manifold.alignmentQuantiles);
+            } else {
+                radius = manifold?.defaultRadius ?? 0.63;
+            }
+            const x = this._v3ToGlobalSpace(raw, manifold);
+            const leg = manifold?.geo ? manifold.geo.leg(radius) : null;
+            const entry = {
+                chunkId: cid,
+                fileId: row.fileId,
+                diaryName: row.diaryName,
+                sourceFile: row.sourceFile,
+                starName,
+                text: row.text || '',
+                raw,
+                x,
+                z: null,
+                slot,
+                radius,
+                leg
+            };
+            allChunks.push(entry);
+            if (byName.has(starName)) {
+                byName.get(starName).chunks.push(entry);
+            } else {
+                byName.set(starName, { ...entry, chunks: [entry] });
+            }
+        }
+
+        // 多 Chunk 星卡语义聚合：融合同一星卡全部分块的原始向量均值，并重算测地半径与 leg，避免截断或碎片漂移
+        const stars = Array.from(byName.values()).map((st) => {
+            if (!Array.isArray(st.chunks) || st.chunks.length <= 1) return st;
+            const aggRaw = this._v3WeightedCentroid(st.chunks.map(c => ({ vector: c.raw, weight: 1 })));
+            if (!aggRaw) return st;
+            const aggX = this._v3ToGlobalSpace(aggRaw, manifold);
+            let aggRadius = st.radius;
+            if (manifold?.alignmentQuantiles && manifold?.meanAxis && aggRaw.length === manifold.meanAxis.length) {
+                aggRadius = this._v3ComputeChunkQuantileRadius(this._v3Dot(aggRaw, manifold.meanAxis), manifold.alignmentQuantiles);
+            } else {
+                const finiteRadii = st.chunks.map(c => c.radius).filter(Number.isFinite);
+                if (finiteRadii.length > 0) {
+                    aggRadius = finiteRadii.reduce((s, r) => s + r, 0) / finiteRadii.length;
+                }
+            }
+            const aggLeg = manifold?.geo ? manifold.geo.leg(aggRadius) : st.leg;
+            return { ...st, raw: aggRaw, x: aggX || st.x, radius: aggRadius, leg: aggLeg };
+        });
+        if (stars.length === 0) {
+            this._v3StarPoolCache.delete(scopeKey);
+            return null;
+        }
+
+        const dim = stars[0].x.length;
+        const meanAcc = new Float64Array(dim);
+        let inDegSum = 0;
+        let inDegCount = 0;
+        const starSlots = new Set();
+        for (const st of stars) {
+            if (st.x && st.x.length === dim) {
+                for (let d = 0; d < dim; d++) meanAcc[d] += st.x[d];
+            }
+            if (st.slot !== undefined) {
+                starSlots.add(st.slot);
+                if (manifold?.inDeg) {
+                    inDegSum += manifold.inDeg[st.slot] || 0;
+                    inDegCount++;
+                }
+            }
+        }
+        const starMeanAxis = this._v3NormalizeVector(meanAcc);
+        let alignSum = 0;
+        let alignSqSum = 0;
+        let alignCount = 0;
+        if (starMeanAxis) {
+            for (const st of stars) {
+                if (st.x && st.x.length === starMeanAxis.length) {
+                    const al = this._v3Dot(st.x, starMeanAxis);
+                    alignSum += al;
+                    alignSqSum += al * al;
+                    alignCount++;
+                }
+            }
+        }
+        const meanAlignMean = alignCount > 0 ? (alignSum / alignCount) : null;
+        const meanAlignStd = alignCount > 1
+            ? Math.sqrt(Math.max(1e-6, alignSqSum / alignCount - meanAlignMean * meanAlignMean))
+            : null;
+        // 解析零均值去中心化闭式 β_* = 1 - √(1 - ā²) / (ā·√(N - 1))，收紧上限 0.96 防止万星扩编压扁径向自由度
+        const betaStar = (
+            stars.length >= 16
+            && Number.isFinite(meanAlignMean)
+            && meanAlignMean > 0.1
+            && meanAlignMean < 0.999
+        )
+            ? Math.max(0.5, Math.min(0.96, 1 - Math.sqrt(Math.max(0, 1 - meanAlignMean * meanAlignMean)) / (meanAlignMean * Math.sqrt(Math.max(1, stars.length - 1)))))
+            : 0.85;
+
+        const byChunkId = new Map();
+        const byStarName = new Map();
+        const bySlot = new Map();
+        const zMatrix = new Float32Array(stars.length * dim);
+        const indexByStarName = new Map();
+        for (const st of allChunks) {
+            st.zRaw = this._v3ToStarSpace(st.x, starMeanAxis, betaStar);
+            st.z = st.zRaw;
+            byChunkId.set(st.chunkId, st);
+            if (st.slot !== undefined) {
+                bySlot.set(st.slot, st);
+            }
+        }
+        for (let si = 0; si < stars.length; si++) {
+            const st = stars[si];
+            if (Array.isArray(st.chunks) && st.chunks.length > 1) {
+                st.zRaw = this._v3ToStarSpace(st.x, starMeanAxis, betaStar);
+                st.z = st.zRaw;
+                // 多 Chunk 星卡聚合后同步回写每块分块的 raw/x/radius/leg/z/zRaw，防止 Step 1 召回非首块 chunk 时拿到碎片方向与半径
+                for (const ch of st.chunks) {
+                    ch.raw = st.raw;
+                    ch.x = st.x;
+                    ch.radius = st.radius;
+                    ch.leg = st.leg;
+                    ch.zRaw = st.zRaw;
+                    ch.z = st.z;
+                }
+            } else {
+                const c0 = byChunkId.get(st.chunkId);
+                if (c0) {
+                    st.zRaw = c0.zRaw;
+                    st.z = c0.z;
+                } else {
+                    st.zRaw = this._v3ToStarSpace(st.x, starMeanAxis, betaStar);
+                    st.z = st.zRaw;
+                }
+            }
+            if (st.z && st.z.length === dim) {
+                zMatrix.set(st.z, si * dim);
+            }
+            indexByStarName.set(st.starName, si);
+            byStarName.set(st.starName, st);
+        }
+
+        // 星池自标定无尺度分布描述子（Fisher-Tippett 极值闭式，随星池扩编自动重标定）
+        const ft = this._v3FisherTippettParams(stars.length);
+        const tauExtremeZ = ft.tau;
+
+        let orthTopScale = 0.22;
+        let pairMeanCos = 0;
+        let pairStdCos = 1 / Math.sqrt(Math.max(1, dim));
+        let nnStepMed = 1.25;
+        if (stars.length >= 16) {
+            const probeStep = Math.max(1, Math.floor(stars.length / 48));
+            const probeTops = [];
+            let pairSum = 0;
+            let pairSqSum = 0;
+            let pairCount = 0;
+            for (let pi = 0; pi < stars.length; pi += probeStep) {
+                const zp = stars[pi].z;
+                if (!zp) continue;
+                let best1 = -Infinity;
+                for (let pj = 0; pj < stars.length; pj++) {
+                    if (pj === pi) continue;
+                    const zj = stars[pj].z;
+                    if (!zj) continue;
+                    const s = this._v3Dot(zp, zj);
+                    pairSum += s;
+                    pairSqSum += s * s;
+                    pairCount++;
+                    if (s > best1) best1 = s;
+                }
+                if (Number.isFinite(best1) && best1 > 0) probeTops.push(best1);
+            }
+            if (pairCount > 1) {
+                pairMeanCos = pairSum / pairCount;
+                pairStdCos = Math.sqrt(Math.max(1e-6, pairSqSum / pairCount - pairMeanCos * pairMeanCos));
+            }
+            if (probeTops.length >= 4) {
+                probeTops.sort((a, b) => a - b);
+                const med = probeTops[Math.floor(probeTops.length * 0.5)];
+                if (Number.isFinite(med) && med > 0.05) {
+                    orthTopScale = Math.max(0.10, Math.min(0.55, med));
+                    nnStepMed = Math.sqrt(Math.max(1e-6, 2 * (1 - med)));
+                }
+            }
+        }
+        // 纯张量盲区零分布解析闭式（零伪 Gram / 零外部样本依赖）：
+        // 三体非负锥合力覆盖振幅若低于单星 Fisher-Tippett 期望极值 b_N·σ_pair，触发中度盲区 ⊘(r_⊥)；
+        // 若连下界 (b_N - 2·a_N)·σ_pair 都达不到，触发深度盲区 ⊘(r_⊥ ≫ 0)。
+        const covBase = Math.min(0.65, Math.max(0.10, ft.bN * pairStdCos));
+        const covHigh = Math.min(covBase, Math.max(pairStdCos, (ft.bN - 2 * ft.aN) * pairStdCos));
+        const coneResidualBase = Math.sqrt(Math.max(0.01, 1 - covBase * covBase));
+        const coneResidualHigh = Math.max(coneResidualBase + 0.005, Math.sqrt(Math.max(0.01, 1 - covHigh * covHigh)));
+        const needsCoarseSubspace = stars.length * dim >= 2000 * 3072;
+        const coarseSubspace = (needsCoarseSubspace && options.syncCoarseSubspace === true)
+            ? this._v3BuildCoarseSubspace(zMatrix, stars.length, dim, pairStdCos)
+            : null;
+        const exposureIndex3 = stars.length >= 16
+            ? this._v3BuildExposureIndex3(zMatrix, stars.length, dim)
+            : null;
+
+        const nowLoaded = Date.now();
+        const pool = {
+            versionKey,
+            manifoldKey,
+            dbStatSig,
+            dbGen,
+            checkedAt: nowLoaded,
+            sqlVerifiedAt: nowLoaded,
+            stars,
+            zMatrix,
+            zDim: dim,
+            coarseSubspace,
+            exposureIndex3,
+            indexByStarName,
+            byChunkId,
+            byStarName,
+            bySlot,
+            starSlots,
+            starMeanAxis,
+            betaStar,
+            meanAlignMean,
+            meanAlignStd,
+            tauExtremeZ,
+            gumbelAN: ft.aN,
+            gumbelBN: ft.bN,
+            orthTopScale,
+            pairMeanCos,
+            pairStdCos,
+            nnStepMed,
+            coneResidualBase,
+            coneResidualHigh,
+            manifoldMissingStars,
+            avgStarInDeg: inDegCount > 0 ? Math.max(4, inDegSum / inDegCount) : 32,
+            epaDigest,
+            epaMean
+        };
+        this._v3StarPoolCache.delete(scopeKey);
+        while (this._v3StarPoolCache.size >= MAX_STAR_POOL_CACHE_ENTRIES) {
+            const oldestKey = this._v3StarPoolCache.keys().next().value;
+            if (oldestKey === undefined) break;
+            this._v3StarPoolCache.delete(oldestKey);
+        }
+        this._v3StarPoolCache.set(scopeKey, pool);
+        if (needsCoarseSubspace && !pool.coarseSubspace && options.asyncCoarseSubspace !== false) {
+            this._v3ScheduleCoarseSubspaceBuild(pool, scopeKey);
+        }
+        return pool;
+    }
+
+    _v3LoadStarPoolCacheNativeAsync(vdb, normalizedDiaries, manifold, ctx) {
+        const { scopeKey, manifoldKey, ttlMs, dbGen, cached, options } = ctx;
+        if (!this._v3StarPoolLoads) this._v3StarPoolLoads = new Map();
+        const flightKey = `${scopeKey}\0${manifoldKey}\0${dbGen ?? 'nogen'}`;
+        if (this._v3StarPoolLoads.has(flightKey)) {
+            return this._v3StarPoolLoads.get(flightKey);
+        }
+
+        const job = (async () => {
+            try {
+                const crypto = require('node:crypto');
+                const dbPath = vdb.dbPath;
+                const rawPaths = await vdb.nativeKnowledgeRuntime.listIndexedFilePaths(dbPath);
+                const allPaths = typeof rawPaths === 'string' ? JSON.parse(rawPaths) : rawPaths;
+                const diarySet = new Set(normalizedDiaries);
+                const wantRoot = diarySet.has('Root');
+                const prefixes = normalizedDiaries.filter(d => d !== 'Root').map(d => `${d}/`);
+                const matchedPaths = (Array.isArray(allPaths) ? allPaths : []).filter((p) => {
+                    const norm = String(p || '').replace(/\\/g, '/');
+                    if (!norm) return false;
+                    if (wantRoot && !norm.includes('/')) return true;
+                    return prefixes.some(pref => norm.startsWith(pref));
+                });
+
+                const rows = [];
+                const BATCH_SIZE = 400;
+                for (let i = 0; i < matchedPaths.length; i += BATCH_SIZE) {
+                    const batch = matchedPaths.slice(i, i + BATCH_SIZE);
+                    const hydrated = await vdb.hydrateChunksByFilePaths(batch);
+                    if (!Array.isArray(hydrated)) continue;
+                    for (const item of hydrated) {
+                        if (!item || !diarySet.has(item.diaryName)) continue;
+                        rows.push(item);
+                    }
+                }
+                rows.sort((a, b) => Number(a.chunkId ?? a.id) - Number(b.chunkId ?? b.id));
+
+                const epaRec = await this._v3LoadEpaRecordIsolatedAsync(vdb, { dbGen, manifoldKey, ttlMs });
+                const epaDigest = epaRec?.digest || null;
+                const epaMean = epaRec?.value || null;
+
+                const hash = crypto.createHash('sha256');
+                hash.update(`${manifoldKey}|${epaDigest || 'none'}|${rows.length}`);
+                for (const r of rows) {
+                    const v = r.vector;
+                    const len = v ? v.length : 0;
+                    const v0 = len > 0 ? v[0] : 0;
+                    const vMid = len > 1 ? v[len >> 1] : 0;
+                    const vLast = len > 2 ? v[len - 1] : 0;
+                    hash.update(`\0${r.chunkId ?? r.id}:${r.fileId}:${(r.text || '').length}:${len}:${v0}:${vMid}:${vLast}`);
+                }
+                const versionKey = `native|${hash.digest('hex').slice(0, 24)}`;
+                if (cached && cached.versionKey === versionKey) {
+                    const refreshedNow = Date.now();
+                    cached.checkedAt = refreshedNow;
+                    cached.sqlVerifiedAt = refreshedNow;
+                    cached.dbGen = dbGen;
+                    this._v3StarPoolCache.delete(scopeKey);
+                    this._v3StarPoolCache.set(scopeKey, cached);
+                    return cached;
+                }
+
+                return this._v3BuildStarPoolFromRows(rows, {
+                    scopeKey,
+                    manifold,
+                    manifoldKey,
+                    versionKey,
+                    dbStatSig: null,
+                    dbGen,
+                    epaDigest,
+                    epaMean,
+                    options
+                });
+            } catch (err) {
+                console.warn('[MetaThinkingManager][V3] 原生 Read Pool 读取星池张量缓存失败，回退动态候选池:', err.message);
+                if (cached && cached.manifoldKey === manifoldKey) {
+                    cached.checkedAt = Date.now();
+                    return cached;
+                }
+                return null;
+            } finally {
+                this._v3StarPoolLoads.delete(flightKey);
+            }
+        })();
+
+        this._v3StarPoolLoads.set(flightKey, job);
+        return job;
+    }
+
     /**
      * 只读加载并缓存星池完整张量库（~716 星，支持未来扩编至数千星及多 Chunk 星卡），
      * 预计算 V5 全局方向 x̂、星池去中心化方向 ẑ、测地半径 leg 及 Fisher-Tippett 无尺度统计描述子。
+     * - 当 vdb.nativeKnowledgeRuntime 存在（生产 KnowledgeBaseManager 由 vexus-lite 托管 SQLite）时，
+     *   严禁在主进程用 better-sqlite3 打开同一 DB（防 Linux POSIX fcntl 跨库锁误杀触发 SIGBUS），
+     *   改为经 Rust Read Pool (listIndexedFilePaths + hydrateChunksByFilePaths) + databaseGeneration 异步加载；
+     * - 当 vdb 无 nativeKnowledgeRuntime（离线/单测隔离 SQLite）时，保持原有同步 better-sqlite3 只读路径。
      */
     _v3LoadStarPoolCache(vdb, diaryNames, manifold, options = {}) {
         const dbPath = vdb?.dbPath;
@@ -1801,12 +2383,38 @@ class MetaThinkingManager {
         )].sort();
         if (normalizedDiaries.length === 0) return null;
         if (!this._v3StarPoolCache) this._v3StarPoolCache = new Map();
-        const MAX_STAR_POOL_CACHE_ENTRIES = 8;
         const scopeKey = `${dbPath}\0${normalizedDiaries.join('\0')}`;
         const manifoldKey = manifold?.cacheKey || 'no-manifold';
         const ttlMs = options.ttlMs ?? 3000;
         const now = Date.now();
         const cached = this._v3StarPoolCache.get(scopeKey);
+
+        // 生产路径：vdb 由 vexus-lite 托管时绝不调用主进程 better-sqlite3，避免 Linux POSIX fcntl 锁误杀 SIGBUS
+        if (vdb?.nativeKnowledgeRuntime) {
+            const dbGen = this._v3GetNativeDatabaseGeneration(vdb);
+            if (cached && cached.manifoldKey === manifoldKey && ttlMs > 0) {
+                const genFresh = dbGen !== null && cached.dbGen === dbGen;
+                const ttlFresh = dbGen === null && (now - (cached.checkedAt || 0)) < ttlMs;
+                if (genFresh || ttlFresh) {
+                    if (genFresh) cached.checkedAt = now;
+                    this._v3StarPoolCache.delete(scopeKey);
+                    this._v3StarPoolCache.set(scopeKey, cached);
+                    return cached;
+                }
+            }
+            if (!this._v3UsesNativeKnowledgeRuntime(vdb)) {
+                return cached && cached.manifoldKey === manifoldKey ? cached : null;
+            }
+            return this._v3LoadStarPoolCacheNativeAsync(vdb, normalizedDiaries, manifold, {
+                scopeKey,
+                manifoldKey,
+                ttlMs,
+                dbGen,
+                cached,
+                options
+            });
+        }
+
         if (cached && cached.manifoldKey === manifoldKey && ttlMs > 0 && (now - (cached.checkedAt || 0)) < ttlMs) {
             this._v3StarPoolCache.delete(scopeKey);
             this._v3StarPoolCache.set(scopeKey, cached);
@@ -1904,296 +2512,18 @@ class MetaThinkingManager {
                  ORDER BY c.id ASC`
             ).all(...normalizedDiaries);
 
-            const byName = new Map();
-            const allChunks = [];
-            let manifoldMissingStars = 0;
-            const hasVersionBaseline = Boolean(
-                (manifold?.trainedVersions && Object.keys(manifold.trainedVersions).length > 0)
-                || (manifold?.convertedVersions && Object.keys(manifold.convertedVersions).length > 0)
-            );
-            for (const row of rows) {
-                const buf = row.vec;
-                if (!buf || buf.byteLength === 0 || buf.byteLength % 4 !== 0) continue;
-                const f32 = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-                const raw = this._v3NormalizeVector(f32);
-                if (!raw) continue;
-                const starName = this._extractV3StarName(row);
-                if (!starName) continue;
-
-                const cid = Number(row.chunkId);
-                const trainedVer = manifold?.convertedVersions?.[cid] ?? manifold?.trainedVersions?.[cid] ?? null;
-                const isVersionMatched = !manifold || !hasVersionBaseline || (
-                    Array.isArray(trainedVer)
-                    && Number(trainedVer[0]) === Number(row.vectorVersion)
-                    && Number(trainedVer[1]) === Number(row.fileId)
-                );
-                const slot = isVersionMatched ? manifold?.idToSlot?.get(cid) : undefined;
-                const inConvertedTail = Boolean(isVersionMatched && manifold?.convertedChunkIds?.has(cid));
-                if (manifold && slot === undefined && !inConvertedTail) manifoldMissingStars++;
-                let radius;
-                if (isVersionMatched && manifold?.radiusByChunkId && manifold.radiusByChunkId.has(cid)) {
-                    radius = manifold.radiusByChunkId.get(cid);
-                } else if (manifold?.alignmentQuantiles && manifold?.meanAxis && raw.length === manifold.meanAxis.length) {
-                    radius = this._v3ComputeChunkQuantileRadius(this._v3Dot(raw, manifold.meanAxis), manifold.alignmentQuantiles);
-                } else {
-                    radius = manifold?.defaultRadius ?? 0.63;
-                }
-                const x = this._v3ToGlobalSpace(raw, manifold);
-                const leg = manifold?.geo ? manifold.geo.leg(radius) : null;
-                const entry = {
-                    chunkId: cid,
-                    fileId: row.fileId,
-                    diaryName: row.diaryName,
-                    sourceFile: row.sourceFile,
-                    starName,
-                    text: row.text || '',
-                    raw,
-                    x,
-                    z: null,
-                    slot,
-                    radius,
-                    leg
-                };
-                allChunks.push(entry);
-                if (byName.has(starName)) {
-                    byName.get(starName).chunks.push(entry);
-                } else {
-                    byName.set(starName, { ...entry, chunks: [entry] });
-                }
-            }
-
-            // 多 Chunk 星卡语义聚合：融合同一星卡全部分块的原始向量均值，并重算测地半径与 leg，避免截断或碎片漂移
-            const stars = Array.from(byName.values()).map((st) => {
-                if (!Array.isArray(st.chunks) || st.chunks.length <= 1) return st;
-                const aggRaw = this._v3WeightedCentroid(st.chunks.map(c => ({ vector: c.raw, weight: 1 })));
-                if (!aggRaw) return st;
-                const aggX = this._v3ToGlobalSpace(aggRaw, manifold);
-                let aggRadius = st.radius;
-                if (manifold?.alignmentQuantiles && manifold?.meanAxis && aggRaw.length === manifold.meanAxis.length) {
-                    aggRadius = this._v3ComputeChunkQuantileRadius(this._v3Dot(aggRaw, manifold.meanAxis), manifold.alignmentQuantiles);
-                } else {
-                    const finiteRadii = st.chunks.map(c => c.radius).filter(Number.isFinite);
-                    if (finiteRadii.length > 0) {
-                        aggRadius = finiteRadii.reduce((s, r) => s + r, 0) / finiteRadii.length;
-                    }
-                }
-                const aggLeg = manifold?.geo ? manifold.geo.leg(aggRadius) : st.leg;
-                return { ...st, raw: aggRaw, x: aggX || st.x, radius: aggRadius, leg: aggLeg };
-            });
-            if (stars.length === 0) {
-                this._v3StarPoolCache.delete(scopeKey);
-                return null;
-            }
-
-            const dim = stars[0].x.length;
-            const meanAcc = new Float64Array(dim);
-            let inDegSum = 0;
-            let inDegCount = 0;
-            const starSlots = new Set();
-            for (const st of stars) {
-                if (st.x && st.x.length === dim) {
-                    for (let d = 0; d < dim; d++) meanAcc[d] += st.x[d];
-                }
-                if (st.slot !== undefined) {
-                    starSlots.add(st.slot);
-                    if (manifold?.inDeg) {
-                        inDegSum += manifold.inDeg[st.slot] || 0;
-                        inDegCount++;
-                    }
-                }
-            }
-            const starMeanAxis = this._v3NormalizeVector(meanAcc);
-            let alignSum = 0;
-            let alignSqSum = 0;
-            let alignCount = 0;
-            if (starMeanAxis) {
-                for (const st of stars) {
-                    if (st.x && st.x.length === starMeanAxis.length) {
-                        const al = this._v3Dot(st.x, starMeanAxis);
-                        alignSum += al;
-                        alignSqSum += al * al;
-                        alignCount++;
-                    }
-                }
-            }
-            const meanAlignMean = alignCount > 0 ? (alignSum / alignCount) : null;
-            const meanAlignStd = alignCount > 1
-                ? Math.sqrt(Math.max(1e-6, alignSqSum / alignCount - meanAlignMean * meanAlignMean))
-                : null;
-            // 解析零均值去中心化闭式 β_* = 1 - √(1 - ā²) / (ā·√(N - 1))，收紧上限 0.96 防止万星扩编压扁径向自由度
-            const betaStar = (
-                stars.length >= 16
-                && Number.isFinite(meanAlignMean)
-                && meanAlignMean > 0.1
-                && meanAlignMean < 0.999
-            )
-                ? Math.max(0.5, Math.min(0.96, 1 - Math.sqrt(Math.max(0, 1 - meanAlignMean * meanAlignMean)) / (meanAlignMean * Math.sqrt(Math.max(1, stars.length - 1)))))
-                : 0.85;
-
-            let epaMeanRaw = null;
-            if (epaRow?.value) {
-                try {
-                    const parsedEpa = JSON.parse(epaRow.value);
-                    const b64 = parsedEpa?.mean;
-                    if (typeof b64 === 'string' && b64) {
-                        const buf = Buffer.from(b64, 'base64');
-                        if (buf.byteLength > 0 && buf.byteLength % 4 === 0) {
-                            epaMeanRaw = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-                        }
-                    }
-                } catch (_) {
-                    epaMeanRaw = null;
-                }
-            }
-
-            const byChunkId = new Map();
-            const byStarName = new Map();
-            const bySlot = new Map();
-            const zMatrix = new Float32Array(stars.length * dim);
-            const indexByStarName = new Map();
-            for (const st of allChunks) {
-                st.zRaw = this._v3ToStarSpace(st.x, starMeanAxis, betaStar);
-                st.z = st.zRaw;
-                byChunkId.set(st.chunkId, st);
-                if (st.slot !== undefined) {
-                    bySlot.set(st.slot, st);
-                }
-            }
-            for (let si = 0; si < stars.length; si++) {
-                const st = stars[si];
-                if (Array.isArray(st.chunks) && st.chunks.length > 1) {
-                    st.zRaw = this._v3ToStarSpace(st.x, starMeanAxis, betaStar);
-                    st.z = st.zRaw;
-                    // 多 Chunk 星卡聚合后同步回写每块分块的 raw/x/radius/leg/z/zRaw，防止 Step 1 召回非首块 chunk 时拿到碎片方向与半径
-                    for (const ch of st.chunks) {
-                        ch.raw = st.raw;
-                        ch.x = st.x;
-                        ch.radius = st.radius;
-                        ch.leg = st.leg;
-                        ch.zRaw = st.zRaw;
-                        ch.z = st.z;
-                    }
-                } else {
-                    const c0 = byChunkId.get(st.chunkId);
-                    if (c0) {
-                        st.zRaw = c0.zRaw;
-                        st.z = c0.z;
-                    } else {
-                        st.zRaw = this._v3ToStarSpace(st.x, starMeanAxis, betaStar);
-                        st.z = st.zRaw;
-                    }
-                }
-                if (st.z && st.z.length === dim) {
-                    zMatrix.set(st.z, si * dim);
-                }
-                indexByStarName.set(st.starName, si);
-                byStarName.set(st.starName, st);
-            }
-
-            // 星池自标定无尺度分布描述子（Fisher-Tippett 极值闭式，随星池扩编自动重标定）
-            const ft = this._v3FisherTippettParams(stars.length);
-            const tauExtremeZ = ft.tau;
-
-            let orthTopScale = 0.22;
-            let pairMeanCos = 0;
-            let pairStdCos = 1 / Math.sqrt(Math.max(1, dim));
-            let nnStepMed = 1.25;
-            if (stars.length >= 16) {
-                const probeStep = Math.max(1, Math.floor(stars.length / 48));
-                const probeTops = [];
-                let pairSum = 0;
-                let pairSqSum = 0;
-                let pairCount = 0;
-                for (let pi = 0; pi < stars.length; pi += probeStep) {
-                    const zp = stars[pi].z;
-                    if (!zp) continue;
-                    let best1 = -Infinity;
-                    for (let pj = 0; pj < stars.length; pj++) {
-                        if (pj === pi) continue;
-                        const zj = stars[pj].z;
-                        if (!zj) continue;
-                        const s = this._v3Dot(zp, zj);
-                        pairSum += s;
-                        pairSqSum += s * s;
-                        pairCount++;
-                        if (s > best1) best1 = s;
-                    }
-                    if (Number.isFinite(best1) && best1 > 0) probeTops.push(best1);
-                }
-                if (pairCount > 1) {
-                    pairMeanCos = pairSum / pairCount;
-                    pairStdCos = Math.sqrt(Math.max(1e-6, pairSqSum / pairCount - pairMeanCos * pairMeanCos));
-                }
-                if (probeTops.length >= 4) {
-                    probeTops.sort((a, b) => a - b);
-                    const med = probeTops[Math.floor(probeTops.length * 0.5)];
-                    if (Number.isFinite(med) && med > 0.05) {
-                        orthTopScale = Math.max(0.10, Math.min(0.55, med));
-                        nnStepMed = Math.sqrt(Math.max(1e-6, 2 * (1 - med)));
-                    }
-                }
-            }
-            // 纯张量盲区零分布解析闭式（零伪 Gram / 零外部样本依赖）：
-            // 三体非负锥合力覆盖振幅若低于单星 Fisher-Tippett 期望极值 b_N·σ_pair，触发中度盲区 ⊘(r_⊥)；
-            // 若连下界 (b_N - 2·a_N)·σ_pair 都达不到，触发深度盲区 ⊘(r_⊥ ≫ 0)。
-            const covBase = Math.min(0.65, Math.max(0.10, ft.bN * pairStdCos));
-            const covHigh = Math.min(covBase, Math.max(pairStdCos, (ft.bN - 2 * ft.aN) * pairStdCos));
-            const coneResidualBase = Math.sqrt(Math.max(0.01, 1 - covBase * covBase));
-            const coneResidualHigh = Math.max(coneResidualBase + 0.005, Math.sqrt(Math.max(0.01, 1 - covHigh * covHigh)));
-            const needsCoarseSubspace = stars.length * dim >= 2000 * 3072;
-            const coarseSubspace = (needsCoarseSubspace && options.syncCoarseSubspace === true)
-                ? this._v3BuildCoarseSubspace(zMatrix, stars.length, dim, pairStdCos)
-                : null;
-            const exposureIndex3 = stars.length >= 16
-                ? this._v3BuildExposureIndex3(zMatrix, stars.length, dim)
-                : null;
-
-            const nowLoaded = Date.now();
-            const pool = {
-                versionKey,
+            const parsedEpa = this._v3ParseEpaBasisValue(epaRow?.value);
+            return this._v3BuildStarPoolFromRows(rows, {
+                scopeKey,
+                manifold,
                 manifoldKey,
+                versionKey,
                 dbStatSig: currentStatSig || getDbStatSig(),
-                checkedAt: nowLoaded,
-                sqlVerifiedAt: nowLoaded,
-                stars,
-                zMatrix,
-                zDim: dim,
-                coarseSubspace,
-                exposureIndex3,
-                indexByStarName,
-                byChunkId,
-                byStarName,
-                bySlot,
-                starSlots,
-                starMeanAxis,
-                betaStar,
-                meanAlignMean,
-                meanAlignStd,
-                tauExtremeZ,
-                gumbelAN: ft.aN,
-                gumbelBN: ft.bN,
-                orthTopScale,
-                pairMeanCos,
-                pairStdCos,
-                nnStepMed,
-                coneResidualBase,
-                coneResidualHigh,
-                manifoldMissingStars,
-                avgStarInDeg: inDegCount > 0 ? Math.max(4, inDegSum / inDegCount) : 32,
-                epaDigest,
-                epaMean: epaMeanRaw ? (this._v3NormalizeVector(epaMeanRaw) || null) : null
-            };
-            this._v3StarPoolCache.delete(scopeKey);
-            while (this._v3StarPoolCache.size >= MAX_STAR_POOL_CACHE_ENTRIES) {
-                const oldestKey = this._v3StarPoolCache.keys().next().value;
-                if (oldestKey === undefined) break;
-                this._v3StarPoolCache.delete(oldestKey);
-            }
-            this._v3StarPoolCache.set(scopeKey, pool);
-            if (needsCoarseSubspace && !pool.coarseSubspace && options.asyncCoarseSubspace !== false) {
-                this._v3ScheduleCoarseSubspaceBuild(pool, scopeKey);
-            }
-            return pool;
+                dbGen: null,
+                epaDigest: parsedEpa?.digest || epaDigest,
+                epaMean: parsedEpa?.value || null,
+                options
+            });
         } catch (err) {
             console.warn('[MetaThinkingManager][V3] 读取星池张量缓存失败，回退动态候选池:', err.message);
             if (cached && cached.manifoldKey === manifoldKey) {
@@ -2337,6 +2667,9 @@ class MetaThinkingManager {
 
     /**
      * 只读加载并缓存 V5.2 全局 Tag 均值轴 epa_basis_cache.mean（供 31k-Tag 切空间去均值分布检验）。
+     * - 当 vdb.nativeKnowledgeRuntime 存在时，严禁主进程调用 better-sqlite3（防 Linux POSIX fcntl 锁误杀），
+     *   改为经独立 PID 子进程/原生接口只读获取并按 databaseGeneration 强缓存；
+     * - 离线/单测 mock SQLite 无 nativeKnowledgeRuntime 时保留同步路径。
      */
     _v3LoadEpaMean(vdb, options = {}) {
         const dbPath = vdb?.dbPath;
@@ -2345,6 +2678,15 @@ class MetaThinkingManager {
         const ttlMs = options.ttlMs ?? 15000;
         const now = Date.now();
         const cached = this._v3EpaMeanCache.get(dbPath);
+        if (vdb?.nativeKnowledgeRuntime) {
+            const dbGen = this._v3GetNativeDatabaseGeneration(vdb);
+            if (cached && ttlMs > 0) {
+                const genSame = dbGen !== null && cached.dbGen === dbGen;
+                const ttlFresh = dbGen === null && (now - (cached.checkedAt || 0)) < ttlMs;
+                if (genSame || ttlFresh) return cached.value;
+            }
+            return this._v3LoadEpaRecordIsolatedAsync(vdb, { dbGen, ttlMs }).then(rec => rec?.value || null);
+        }
         if (cached && ttlMs > 0 && (now - (cached.checkedAt || 0)) < ttlMs) {
             return cached.value;
         }
@@ -2362,26 +2704,19 @@ class MetaThinkingManager {
                 this._v3EpaMeanCache.set(dbPath, { checkedAt: now, value: null });
                 return null;
             }
-            const parsed = JSON.parse(row.value);
-            const sig = String(parsed?.artifactSig || '');
-            if (cached && cached.sig === sig && cached.value) {
+            const parsed = this._v3ParseEpaBasisValue(row.value);
+            if (!parsed || !parsed.value) return null;
+            if (cached && cached.sig === parsed.sig && cached.value) {
                 cached.checkedAt = Date.now();
                 return cached.value;
             }
-            const b64 = parsed?.mean;
-            if (typeof b64 !== 'string' || !b64) return null;
-            const buf = Buffer.from(b64, 'base64');
-            if (buf.byteLength === 0 || buf.byteLength % 4 !== 0) return null;
-            const f32 = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-            const unit = this._v3NormalizeVector(f32);
-            if (!unit) return null;
             while (this._v3EpaMeanCache.size >= 4) {
                 const oldestKey = this._v3EpaMeanCache.keys().next().value;
                 if (oldestKey === undefined) break;
                 this._v3EpaMeanCache.delete(oldestKey);
             }
-            this._v3EpaMeanCache.set(dbPath, { sig, checkedAt: Date.now(), value: unit });
-            return unit;
+            this._v3EpaMeanCache.set(dbPath, { sig: parsed.sig, digest: parsed.digest, checkedAt: Date.now(), value: parsed.value });
+            return parsed.value;
         } catch (_) {
             return cached?.value || null;
         } finally {
@@ -4675,12 +5010,14 @@ class MetaThinkingManager {
 
         const vdb = this.ragPlugin?.vectorDBManager;
         const manifold = this._v3LoadGlobalManifold(vdb);
-        const starPool = this._v3LoadStarPoolCache(vdb, diaryNames, manifold);
+        const starPool = await this._v3LoadStarPoolCache(vdb, diaryNames, manifold);
+        throwIfAborted();
         await this._v3EnsureMetaPolarityAxes();
         throwIfAborted();
 
         const hasRealStarPool = Boolean(starPool?.stars?.length >= 16);
-        const epaMean = hasRealStarPool ? (starPool?.epaMean || this._v3LoadEpaMean(vdb)) : null;
+        const epaMean = hasRealStarPool ? (starPool?.epaMean || await this._v3LoadEpaMean(vdb)) : null;
+        throwIfAborted();
         const epaDigest = starPool?.epaDigest || null;
         const expectedDim = manifold?.meanAxis?.length || starPool?.stars?.[0]?.raw?.length || epaMean?.length || 0;
         if (expectedDim > 0 && (!effectiveVector || effectiveVector.length !== expectedDim)) {

@@ -5452,6 +5452,161 @@ test('Star 3 2,000-star two-stage coarse subspace + exposureIndex3 computes U_ne
     assert.ok(recordedCounts[0] > 0 && recordedCounts[0] < 400, `2000-star coarse mode must score only evalThirdCandidates (<400), got ${recordedCounts[0]}`);
 });
 
+test('Issue #643 POSIX fcntl safety: nativeKnowledgeRuntime path NEVER touches in-process better-sqlite3, uses Rust read pool + isolated PID epa reader', async (t) => {
+    const os = require('node:os');
+    const Module = require('node:module');
+    const Database = require('better-sqlite3');
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'v3-issue643-'));
+    t.after(() => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {} });
+    const dbPath = path.join(tmpDir, 'kb_wal.sqlite');
+
+    // Create a real WAL-mode SQLite DB with kv_store.epa_basis_cache (simulating vexus-lite DB on disk)
+    const D = 16;
+    const expectedEpaRaw = new Float32Array(D);
+    expectedEpaRaw[0] = 0.6;
+    expectedEpaRaw[1] = 0.8;
+    const epaJson = JSON.stringify({
+        artifactSig: 'sig-643-v1',
+        mean: Buffer.from(expectedEpaRaw.buffer, expectedEpaRaw.byteOffset, expectedEpaRaw.byteLength).toString('base64')
+    });
+    const setupDb = new Database(dbPath);
+    setupDb.pragma('journal_mode = WAL');
+    setupDb.exec('CREATE TABLE kv_store (key TEXT PRIMARY KEY, value TEXT, vector BLOB);');
+    setupDb.prepare("INSERT INTO kv_store (key, value) VALUES ('epa_basis_cache', ?)").run(epaJson);
+    setupDb.close();
+
+    // Build 20 stars across 希夷星池簇 + 2 unrelated diary paths to verify filtering & batching
+    const allIndexedPaths = ['其他日记/note1.md', 'RootFile.txt'];
+    const chunksByPath = new Map();
+    for (let i = 0; i < 20; i++) {
+        const p = `希夷星池簇/星卡${i}.md`;
+        allIndexedPaths.push(p);
+        const vec = new Float32Array(D);
+        vec[i % D] = 1;
+        vec[(i + 3) % D] = 0.35;
+        chunksByPath.set(p, [{
+            id: 100 + i,
+            chunkId: 100 + i,
+            fileId: 200 + i,
+            text: `星卡${i}正文`,
+            vector: unit(vec),
+            sourceFile: p,
+            diaryName: '希夷星池簇'
+        }]);
+    }
+    chunksByPath.set('其他日记/note1.md', [{
+        id: 999,
+        chunkId: 999,
+        fileId: 999,
+        text: '无关正文',
+        vector: unit(expectedEpaRaw),
+        sourceFile: '其他日记/note1.md',
+        diaryName: '其他日记'
+    }]);
+
+    let dbGen = 42;
+    let listPathsCalls = 0;
+    let hydrateCalls = 0;
+    const mockNativeVdb = {
+        dbPath,
+        nativeKnowledgeRuntime: {
+            databaseGeneration: () => dbGen,
+            listIndexedFilePaths: async () => {
+                listPathsCalls++;
+                return JSON.stringify(allIndexedPaths);
+            }
+        },
+        hydrateChunksByFilePaths: async (paths) => {
+            hydrateCalls++;
+            const out = [];
+            for (const p of paths) {
+                const items = chunksByPath.get(p);
+                if (items) out.push(...items);
+            }
+            return out;
+        }
+    };
+
+    // Guard: intercept Module._load to guarantee in-process better-sqlite3 is NEVER touched when nativeKnowledgeRuntime exists
+    let inProcessBetterSqliteLoads = 0;
+    const origLoad = Module._load;
+    Module._load = function patchedLoad(request, parent, isMain) {
+        if (request === 'better-sqlite3') {
+            inProcessBetterSqliteLoads++;
+            throw new Error('FORBIDDEN: in-process better-sqlite3 must never be loaded when vdb.nativeKnowledgeRuntime exists');
+        }
+        return origLoad.apply(this, arguments);
+    };
+    t.after(() => { Module._load = origLoad; });
+
+    const mtm = new MetaThinkingManager({});
+    let isolatedReadCalls = 0;
+    const origIsolated = mtm._v3ReadKvValueIsolated.bind(mtm);
+    mtm._v3ReadKvValueIsolated = async (p, k) => {
+        isolatedReadCalls++;
+        return origIsolated(p, k);
+    };
+
+    // 1) Concurrent cold-start loads must single-flight deduplicate & load all 20 stars + epaMean with ZERO in-process better-sqlite3
+    const [poolA, poolB] = await Promise.all([
+        mtm._v3LoadStarPoolCache(mockNativeVdb, ['希夷星池簇'], null),
+        mtm._v3LoadStarPoolCache(mockNativeVdb, ['希夷星池簇'], null)
+    ]);
+    assert.strictEqual(poolA, poolB, 'concurrent cold loads must share one single-flight promise');
+    assert.equal(inProcessBetterSqliteLoads, 0, 'must never load better-sqlite3 in-process');
+    assert.equal(listPathsCalls, 1, 'single-flight must call listIndexedFilePaths once');
+    assert.equal(hydrateCalls, 1, 'must hydrate only matching star pool paths');
+    assert.equal(isolatedReadCalls, 1, 'must spawn isolated child process once for epa_basis_cache');
+    assert.equal(poolA.stars.length, 20);
+    assert.ok(poolA.epaMean && Math.abs(poolA.epaMean[0] - 0.6) < 1e-5 && Math.abs(poolA.epaMean[1] - 0.8) < 1e-5);
+    assert.equal(poolA.dbGen, 42);
+
+    // 2) Steady-state call with unchanged databaseGeneration returns synchronously from cache with zero I/O
+    const syncHit = mtm._v3LoadStarPoolCache(mockNativeVdb, ['希夷星池簇'], null);
+    assert.strictEqual(syncHit, poolA, 'unchanged databaseGeneration must return cached pool synchronously');
+    assert.equal(listPathsCalls, 1);
+    const syncEpaHit = mtm._v3LoadEpaMean(mockNativeVdb);
+    assert.strictEqual(syncEpaHit, poolA.epaMean, '_v3LoadEpaMean must hit cache synchronously when databaseGeneration is unchanged');
+    assert.equal(isolatedReadCalls, 1);
+
+    // 3) Unrelated DB write bumps databaseGeneration while star vectors remain identical -> reuses cached pool object (no rebuild!)
+    dbGen = 43;
+    const afterUnrelatedWrite = await mtm._v3LoadStarPoolCache(mockNativeVdb, ['希夷星池簇'], null, { ttlMs: 1 });
+    assert.strictEqual(afterUnrelatedWrite, poolA, 'identical star vectors on new dbGen must reuse existing pool object');
+    assert.equal(poolA.dbGen, 43);
+    assert.equal(listPathsCalls, 2);
+    assert.equal(isolatedReadCalls, 1, 'epaMean within 60s window must not respawn child on unrelated diary write');
+
+    // 4) Actual star edit + dbGen bump -> rebuilds fresh star pool with updated vector
+    dbGen = 44;
+    const editedVec = new Float32Array(D);
+    editedVec[15] = 1;
+    chunksByPath.get('希夷星池簇/星卡0.md')[0].vector = editedVec;
+    const afterStarEdit = await mtm._v3LoadStarPoolCache(mockNativeVdb, ['希夷星池簇'], null, { ttlMs: 1 });
+    assert.notStrictEqual(afterStarEdit, poolA, 'edited star vector must produce fresh starPool');
+    assert.ok(afterStarEdit.byStarName.get('星卡0').raw[15] > 0.99);
+    assert.equal(inProcessBetterSqliteLoads, 0);
+
+    // 5) Future native getKvValue hook bypasses child process completely
+    let nativeKvCalls = 0;
+    mockNativeVdb.nativeKnowledgeRuntime.getKvValue = async (_p, k) => {
+        nativeKvCalls++;
+        return k === 'epa_basis_cache' ? epaJson : null;
+    };
+    const nativeEpa = await mtm._v3LoadEpaMean(mockNativeVdb, { ttlMs: 0 });
+    assert.equal(nativeKvCalls, 1, 'when nativeKnowledgeRuntime.getKvValue exists, must prefer it over child process');
+    assert.equal(isolatedReadCalls, 1, 'child process must not be spawned when native getKvValue is present');
+    assert.ok(nativeEpa && Math.abs(nativeEpa[1] - 0.8) < 1e-5);
+
+    // 6) Partial nativeKnowledgeRuntime (missing listIndexedFilePaths) must still NEVER fall back to in-process better-sqlite3
+    const partialVdb = { dbPath, nativeKnowledgeRuntime: {} };
+    assert.strictEqual(mtm._v3LoadStarPoolCache(partialVdb, ['希夷星池簇'], null, { ttlMs: 0 }), afterStarEdit, 'existing cache should be preserved on partial nativeKnowledgeRuntime');
+    const freshMtm = new MetaThinkingManager({});
+    assert.equal(freshMtm._v3LoadStarPoolCache(partialVdb, ['希夷星池簇'], null, { ttlMs: 0 }), null);
+    assert.equal(inProcessBetterSqliteLoads, 0, 'partial nativeKnowledgeRuntime must never fall back to in-process better-sqlite3');
+});
+
 
 
 
